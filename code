@@ -1,0 +1,3388 @@
+import os
+import time
+import cv2
+import torch
+import numpy as np
+
+from pathlib import Path
+from PIL import Image
+
+from transformers import (
+    AutoImageProcessor,
+    SegformerForSemanticSegmentation
+)
+
+from ultralytics import YOLO
+from collections import deque
+
+
+# ============================================================
+# FSIH MODULE Q
+# O+P + LIVE / VIDEO NAVIGATION
+# ============================================================
+
+print("=" * 78)
+print("FSIH MODULE Q")
+print("PREDICTIVE PATH + ROBUST PERCEPTION + LIVE NAVIGATION")
+print("=" * 78)
+
+
+# ============================================================
+# 1. USER SETTINGS
+# ============================================================
+
+# ------------------------------------------------------------
+# MODE
+#
+# "VIDEO" -> process racing.mp4 and save MP4
+# "LIVE"  -> webcam / live camera
+# ------------------------------------------------------------
+
+MODE = "VIDEO"
+
+
+# ------------------------------------------------------------
+# VIDEO INPUT
+# ------------------------------------------------------------
+
+INPUT_VIDEO = r"C:\Users\sriram\Downloads\racing.mp4"
+
+
+# ------------------------------------------------------------
+# LIVE CAMERA
+#
+# 0 = default webcam
+# 1 = second camera
+# ------------------------------------------------------------
+
+CAMERA_INDEX = 0
+
+
+# ------------------------------------------------------------
+# LIVE DISPLAY
+# ------------------------------------------------------------
+
+SHOW_LIVE_WINDOW = True
+
+
+# ------------------------------------------------------------
+# OPTIONAL VIDEO RECORDING IN LIVE MODE
+#
+# False = maximum performance
+# True  = save live output
+# ------------------------------------------------------------
+
+RECORD_LIVE = False
+
+
+# ============================================================
+# 2. OUTPUT DIRECTORY
+# ============================================================
+
+OUTPUT_DIR = Path(
+    r"C:\Users\sriram\OneDrive\Desktop\fsih\outputs"
+)
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+def next_output():
+
+    n = 1
+
+    while True:
+
+        path = (
+            OUTPUT_DIR /
+            f"fsih_q_output_{n:02d}.mp4"
+        )
+
+        if not path.exists():
+
+            return str(path)
+
+        n += 1
+
+
+OUTPUT_VIDEO = next_output()
+
+
+# ============================================================
+# 3. HUGGING FACE TOKEN
+# ============================================================
+#
+# Optional.
+#
+# Windows PowerShell:
+#
+# $env:HF_TOKEN="your_token_here"
+#
+# Then run:
+#
+# python module_q.py
+#
+# The token is NOT hard-coded into this file.
+# ============================================================
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+if HF_TOKEN:
+
+    print("HF token detected.")
+
+else:
+
+    print(
+        "HF token not set. "
+        "Continuing without explicit token."
+    )
+
+
+# ============================================================
+# 4. MODELS
+# ============================================================
+
+ROAD_MODEL = (
+    "nvidia/segformer-b0-finetuned-cityscapes-1024-1024"
+)
+
+YOLO_MODEL = "yolo26n.pt"
+
+
+# ============================================================
+# 5. DEVICE
+# ============================================================
+
+DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+
+USE_FP16 = (
+    DEVICE == "cuda"
+)
+
+
+print()
+print("Device:", DEVICE)
+print("FP16:", USE_FP16)
+
+
+if DEVICE == "cuda":
+
+    try:
+
+        print(
+            "GPU:",
+            torch.cuda.get_device_name(0)
+        )
+
+    except Exception:
+
+        pass
+
+
+# ============================================================
+# 6. PERFORMANCE SETTINGS
+# ============================================================
+
+AI_SIZE = 512
+
+SEGMENTATION_INTERVAL = 8
+
+DETECTION_INTERVAL = 4
+
+POTHOLE_INTERVAL = 6
+
+PLANNER_WIDTH = 640
+
+
+# ============================================================
+# LIVE PERFORMANCE
+# ============================================================
+
+# Maximum time spent waiting for camera frame.
+CAMERA_BUFFER_SIZE = 1
+
+
+# ============================================================
+# 7. OWN VEHICLE BOUNDARY
+# ============================================================
+
+MIN_BOUNDARY_RATIO = 0.45
+
+MAX_BOUNDARY_RATIO = 0.68
+
+INITIAL_BOUNDARY_RATIO = 0.55
+
+BOUNDARY_SMOOTHING = 0.15
+
+previous_boundary = (
+    INITIAL_BOUNDARY_RATIO
+)
+
+
+# ============================================================
+# 8. NAVIGATION
+# ============================================================
+
+STOP_GAP_RATIO = 0.12
+
+SLOW_GAP_RATIO = 0.22
+
+LEFT_LIMIT = 0.43
+
+RIGHT_LIMIT = 0.57
+
+
+# ============================================================
+# 9. PREDICTION
+# ============================================================
+
+PATH_HISTORY_LENGTH = 12
+
+PREDICTION_FRAMES = 8
+
+MAX_PREDICTION_SHIFT = 0.18
+
+PATH_SMOOTHING = 0.20
+
+CURVE_THRESHOLD = 0.035
+
+
+# ============================================================
+# 10. CONFIDENCE
+# ============================================================
+
+STOP_CONFIDENCE = 0.35
+
+SLOW_CONFIDENCE = 0.55
+
+
+# ============================================================
+# 11. HISTORY
+# ============================================================
+
+path_history = deque(
+    maxlen=PATH_HISTORY_LENGTH
+)
+
+width_history = deque(
+    maxlen=PATH_HISTORY_LENGTH
+)
+
+direction_history = deque(
+    maxlen=6
+)
+
+confidence_history = deque(
+    maxlen=8
+)
+
+previous_path_center = None
+
+previous_predicted_center = None
+
+
+# ============================================================
+# 12. LOAD SEGFORMER
+# ============================================================
+
+print()
+print("Loading SegFormer...")
+
+processor_kwargs = {}
+
+if HF_TOKEN:
+
+    processor_kwargs["token"] = HF_TOKEN
+
+
+try:
+
+    processor = (
+        AutoImageProcessor.from_pretrained(
+            ROAD_MODEL,
+            **processor_kwargs
+        )
+    )
+
+except TypeError:
+
+    # Compatibility with older transformers versions.
+
+    processor = (
+        AutoImageProcessor.from_pretrained(
+            ROAD_MODEL
+        )
+    )
+
+
+model_kwargs = {}
+
+if HF_TOKEN:
+
+    model_kwargs["token"] = HF_TOKEN
+
+
+try:
+
+    road_model = (
+        SegformerForSemanticSegmentation
+        .from_pretrained(
+            ROAD_MODEL,
+            **model_kwargs
+        )
+    )
+
+except TypeError:
+
+    road_model = (
+        SegformerForSemanticSegmentation
+        .from_pretrained(
+            ROAD_MODEL
+        )
+    )
+
+
+road_model.to(
+    DEVICE
+)
+
+road_model.eval()
+
+
+# Enable FP16 for CUDA.
+
+if USE_FP16:
+
+    road_model.half()
+
+
+print("SegFormer loaded.")
+
+
+# ============================================================
+# 13. LOAD YOLO
+# ============================================================
+
+print()
+print("Loading YOLO...")
+
+yolo = YOLO(
+    YOLO_MODEL
+)
+
+print("YOLO loaded.")
+
+
+# ============================================================
+# 14. VIDEO / CAMERA OPEN
+# ============================================================
+
+if MODE.upper() == "VIDEO":
+
+    cap = cv2.VideoCapture(
+        INPUT_VIDEO
+    )
+
+else:
+
+    cap = cv2.VideoCapture(
+        CAMERA_INDEX
+    )
+
+    # Ask camera for a reasonable resolution.
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_WIDTH,
+        1280
+    )
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_HEIGHT,
+        720
+    )
+
+    cap.set(
+        cv2.CAP_PROP_BUFFERSIZE,
+        CAMERA_BUFFER_SIZE
+    )
+
+
+if not cap.isOpened():
+
+    raise RuntimeError(
+        "Could not open video/camera."
+    )
+
+
+# ============================================================
+# 15. VIDEO INFORMATION
+# ============================================================
+
+fps = cap.get(
+    cv2.CAP_PROP_FPS
+)
+
+if fps <= 0:
+
+    fps = 30.0
+
+
+frame_width = int(
+    cap.get(
+        cv2.CAP_PROP_FRAME_WIDTH
+    )
+)
+
+frame_height = int(
+    cap.get(
+        cv2.CAP_PROP_FRAME_HEIGHT
+    )
+)
+
+
+if MODE.upper() == "VIDEO":
+
+    total_frames = int(
+        cap.get(
+            cv2.CAP_PROP_FRAME_COUNT
+        )
+    )
+
+else:
+
+    total_frames = 0
+
+
+PLANNER_HEIGHT = int(
+    frame_height *
+    PLANNER_WIDTH /
+    frame_width
+)
+
+
+print()
+print("=" * 78)
+
+if MODE.upper() == "VIDEO":
+
+    print("MODE: VIDEO")
+
+else:
+
+    print("MODE: LIVE")
+
+
+print(
+    "Resolution:",
+    frame_width,
+    "x",
+    frame_height
+)
+
+print(
+    "Camera/video FPS:",
+    fps
+)
+
+if MODE.upper() == "VIDEO":
+
+    print(
+        "Frames:",
+        total_frames
+    )
+
+print("=" * 78)
+
+
+# ============================================================
+# 16. WRITER
+# ============================================================
+
+writer = None
+
+
+if MODE.upper() == "VIDEO":
+
+    fourcc = cv2.VideoWriter_fourcc(
+        *"mp4v"
+    )
+
+    writer = cv2.VideoWriter(
+        OUTPUT_VIDEO,
+        fourcc,
+        fps,
+        (
+            frame_width,
+            frame_height
+        )
+    )
+
+    if not writer.isOpened():
+
+        raise RuntimeError(
+            "Could not create output video."
+        )
+
+    print(
+        "Output:",
+        OUTPUT_VIDEO
+    )
+
+
+elif RECORD_LIVE:
+
+    live_output = next_output()
+
+    fourcc = cv2.VideoWriter_fourcc(
+        *"mp4v"
+    )
+
+    writer = cv2.VideoWriter(
+        live_output,
+        fourcc,
+        30.0,
+        (
+            frame_width,
+            frame_height
+        )
+    )
+
+    if not writer.isOpened():
+
+        writer = None
+
+    else:
+
+        print(
+            "Live recording:",
+            live_output
+        )
+
+
+# ============================================================
+# 17. CACHE
+# ============================================================
+
+cached_road_mask = np.zeros(
+    (
+        PLANNER_HEIGHT,
+        PLANNER_WIDTH
+    ),
+    dtype=np.uint8
+)
+
+
+cached_obstacle_mask = np.zeros(
+    (
+        PLANNER_HEIGHT,
+        PLANNER_WIDTH
+    ),
+    dtype=np.uint8
+)
+
+
+cached_obstacles = []
+
+cached_obstacle_confidence = 0.0
+
+
+cached_pothole_mask = np.zeros(
+    (
+        PLANNER_HEIGHT,
+        PLANNER_WIDTH
+    ),
+    dtype=np.uint8
+)
+
+
+cached_pothole_confidence = 0.0
+
+
+# ============================================================
+# 18. ROAD SEGMENTATION
+# ============================================================
+
+@torch.no_grad()
+def get_road_mask(frame):
+
+    small = cv2.resize(
+        frame,
+        (
+            AI_SIZE,
+            AI_SIZE
+        )
+    )
+
+
+    rgb = cv2.cvtColor(
+        small,
+        cv2.COLOR_BGR2RGB
+    )
+
+
+    image = Image.fromarray(
+        rgb
+    )
+
+
+    inputs = processor(
+        images=image,
+        return_tensors="pt"
+    )
+
+
+    inputs = {
+        k: v.to(DEVICE)
+        for k, v in inputs.items()
+    }
+
+
+    # FP16 only for floating tensors.
+
+    if USE_FP16:
+
+        inputs = {
+            k: (
+                v.half()
+                if torch.is_floating_point(v)
+                else v
+            )
+            for k, v in inputs.items()
+        }
+
+
+    outputs = road_model(
+        **inputs
+    )
+
+
+    logits = outputs.logits
+
+
+    logits = torch.nn.functional.interpolate(
+        logits,
+        size=(
+            PLANNER_HEIGHT,
+            PLANNER_WIDTH
+        ),
+        mode="bilinear",
+        align_corners=False
+    )
+
+
+    prediction = torch.argmax(
+        logits,
+        dim=1
+    )[0]
+
+
+    road = (
+        prediction.cpu().numpy() == 0
+    ).astype(
+        np.uint8
+    ) * 255
+
+
+    kernel = np.ones(
+        (
+            5,
+            5
+        ),
+        np.uint8
+    )
+
+
+    road = cv2.morphologyEx(
+        road,
+        cv2.MORPH_CLOSE,
+        kernel
+    )
+
+
+    return road
+
+
+# ============================================================
+# 19. DYNAMIC OWN-VEHICLE BOUNDARY
+# ============================================================
+
+def estimate_vehicle_boundary(
+    road_mask
+):
+
+    global previous_boundary
+
+
+    h, w = road_mask.shape
+
+
+    center_x1 = int(
+        w * 0.30
+    )
+
+
+    center_x2 = int(
+        w * 0.70
+    )
+
+
+    search_start = int(
+        h * MIN_BOUNDARY_RATIO
+    )
+
+
+    search_end = int(
+        h * MAX_BOUNDARY_RATIO
+    )
+
+
+    candidate = None
+
+
+    for y in range(
+        search_start,
+        search_end
+    ):
+
+        center_region = road_mask[
+            y,
+            center_x1:center_x2
+        ]
+
+
+        road_ratio = np.mean(
+            center_region > 0
+        )
+
+
+        if road_ratio < 0.15:
+
+            candidate = (
+                y / float(h)
+            )
+
+            break
+
+
+    if candidate is None:
+
+        candidate = (
+            previous_boundary
+        )
+
+
+    candidate = max(
+        MIN_BOUNDARY_RATIO,
+        min(
+            MAX_BOUNDARY_RATIO,
+            candidate
+        )
+    )
+
+
+    smoothed = (
+        previous_boundary *
+        (1.0 - BOUNDARY_SMOOTHING)
+        +
+        candidate *
+        BOUNDARY_SMOOTHING
+    )
+
+
+    previous_boundary = smoothed
+
+
+    return smoothed
+
+
+# ============================================================
+# 20. OWN VEHICLE MASK
+# ============================================================
+
+def own_vehicle_mask(
+    boundary_ratio
+):
+
+    mask = np.zeros(
+        (
+            PLANNER_HEIGHT,
+            PLANNER_WIDTH
+        ),
+        dtype=np.uint8
+    )
+
+
+    boundary_y = int(
+        PLANNER_HEIGHT *
+        boundary_ratio
+    )
+
+
+    mask[
+        boundary_y:,
+        :
+    ] = 255
+
+
+    return mask
+
+
+# ============================================================
+# 21. OBSTACLE DETECTION
+# ============================================================
+
+TARGET_CLASSES = {
+
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "bus",
+    "truck",
+    "traffic light",
+
+    "bench",
+    "chair",
+    "backpack",
+    "suitcase",
+    "umbrella",
+    "fire hydrant"
+}
+
+
+def detect_obstacles(
+    frame,
+    boundary_ratio
+):
+
+    results = yolo.predict(
+        frame,
+        imgsz=AI_SIZE,
+        verbose=False,
+        device=DEVICE
+    )
+
+
+    mask = np.zeros(
+        (
+            PLANNER_HEIGHT,
+            PLANNER_WIDTH
+        ),
+        dtype=np.uint8
+    )
+
+
+    obstacles = []
+
+
+    boundary_y = int(
+        PLANNER_HEIGHT *
+        boundary_ratio
+    )
+
+
+    maximum_confidence = 0.0
+
+
+    for result in results:
+
+        if result.boxes is None:
+
+            continue
+
+
+        names = result.names
+
+
+        for box in result.boxes:
+
+            cls_id = int(
+                box.cls[0].item()
+            )
+
+
+            confidence = float(
+                box.conf[0].item()
+            )
+
+
+            label = names[
+                cls_id
+            ]
+
+
+            if label not in TARGET_CLASSES:
+
+                continue
+
+
+            if confidence < 0.35:
+
+                continue
+
+
+            x1, y1, x2, y2 = (
+                box.xyxy[0]
+                .cpu()
+                .numpy()
+            )
+
+
+            px1 = int(
+                x1 /
+                frame_width *
+                PLANNER_WIDTH
+            )
+
+
+            py1 = int(
+                y1 /
+                frame_height *
+                PLANNER_HEIGHT
+            )
+
+
+            px2 = int(
+                x2 /
+                frame_width *
+                PLANNER_WIDTH
+            )
+
+
+            py2 = int(
+                y2 /
+                frame_height *
+                PLANNER_HEIGHT
+            )
+
+
+            px1 = max(
+                0,
+                min(
+                    PLANNER_WIDTH - 1,
+                    px1
+                )
+            )
+
+
+            px2 = max(
+                0,
+                min(
+                    PLANNER_WIDTH - 1,
+                    px2
+                )
+            )
+
+
+            py1 = max(
+                0,
+                min(
+                    PLANNER_HEIGHT - 1,
+                    py1
+                )
+            )
+
+
+            py2 = max(
+                0,
+                min(
+                    PLANNER_HEIGHT - 1,
+                    py2
+                )
+            )
+
+
+            if px2 <= px1:
+
+                continue
+
+
+            if py2 <= py1:
+
+                continue
+
+
+            # ------------------------------------------------
+            # OWN VEHICLE RULE
+            # ------------------------------------------------
+
+            if py2 <= boundary_y:
+
+                cv2.rectangle(
+                    mask,
+                    (
+                        px1,
+                        py1
+                    ),
+                    (
+                        px2,
+                        py2
+                    ),
+                    255,
+                    -1
+                )
+
+
+                obstacles.append(
+                    (
+                        px1,
+                        py1,
+                        px2,
+                        py2,
+                        label,
+                        confidence
+                    )
+                )
+
+
+                maximum_confidence = max(
+                    maximum_confidence,
+                    confidence
+                )
+
+
+            elif py1 < boundary_y < py2:
+
+                clipped_y2 = boundary_y
+
+
+                if clipped_y2 > py1:
+
+                    cv2.rectangle(
+                        mask,
+                        (
+                            px1,
+                            py1
+                        ),
+                        (
+                            px2,
+                            clipped_y2
+                        ),
+                        255,
+                        -1
+                    )
+
+
+                    obstacles.append(
+                        (
+                            px1,
+                            py1,
+                            px2,
+                            clipped_y2,
+                            label,
+                            confidence
+                        )
+                    )
+
+
+                    maximum_confidence = max(
+                        maximum_confidence,
+                        confidence
+                    )
+
+
+    return (
+        mask,
+        obstacles,
+        maximum_confidence
+    )
+
+
+# ============================================================
+# 22. POTHOLE DETECTION
+# ============================================================
+
+def detect_potholes(
+    frame,
+    road_mask,
+    obstacle_mask,
+    boundary_ratio
+):
+
+    gray = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2GRAY
+    )
+
+
+    gray = cv2.resize(
+        gray,
+        (
+            PLANNER_WIDTH,
+            PLANNER_HEIGHT
+        )
+    )
+
+
+    allowed = road_mask.copy()
+
+
+    allowed[
+        obstacle_mask > 0
+    ] = 0
+
+
+    boundary_y = int(
+        PLANNER_HEIGHT *
+        boundary_ratio
+    )
+
+
+    allowed[
+        boundary_y:,
+        :
+    ] = 0
+
+
+    future_start = int(
+        PLANNER_HEIGHT * 0.32
+    )
+
+
+    allowed[
+        :future_start,
+        :
+    ] = 0
+
+
+    if np.count_nonzero(
+        allowed
+    ) < 100:
+
+        return (
+            np.zeros_like(
+                road_mask
+            ),
+            0.0
+        )
+
+
+    background = cv2.GaussianBlur(
+        gray,
+        (
+            31,
+            31
+        ),
+        0
+    )
+
+
+    normalized = cv2.divide(
+        gray,
+        background,
+        scale=255
+    )
+
+
+    blackhat = cv2.morphologyEx(
+        normalized,
+        cv2.MORPH_BLACKHAT,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (
+                17,
+                17
+            )
+        )
+    )
+
+
+    _, threshold = cv2.threshold(
+        blackhat,
+        30,
+        255,
+        cv2.THRESH_BINARY
+    )
+
+
+    threshold = cv2.bitwise_and(
+        threshold,
+        allowed
+    )
+
+
+    kernel = np.ones(
+        (
+            5,
+            5
+        ),
+        np.uint8
+    )
+
+
+    threshold = cv2.morphologyEx(
+        threshold,
+        cv2.MORPH_OPEN,
+        kernel
+    )
+
+
+    threshold = cv2.morphologyEx(
+        threshold,
+        cv2.MORPH_CLOSE,
+        kernel
+    )
+
+
+    contours, _ = cv2.findContours(
+        threshold,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+
+    pothole_mask = np.zeros_like(
+        road_mask
+    )
+
+
+    accepted = 0
+
+
+    for contour in contours:
+
+        area = cv2.contourArea(
+            contour
+        )
+
+
+        if area < 150:
+
+            continue
+
+
+        if area > 10000:
+
+            continue
+
+
+        x, y, w, h = cv2.boundingRect(
+            contour
+        )
+
+
+        if w <= 0 or h <= 0:
+
+            continue
+
+
+        aspect = (
+            w / float(h)
+        )
+
+
+        if aspect < 0.30:
+
+            continue
+
+
+        if aspect > 3.50:
+
+            continue
+
+
+        component = np.zeros_like(
+            road_mask
+        )
+
+
+        cv2.drawContours(
+            component,
+            [contour],
+            -1,
+            255,
+            -1
+        )
+
+
+        component_pixels = (
+            np.count_nonzero(
+                component
+            )
+        )
+
+
+        road_pixels = (
+            np.count_nonzero(
+                cv2.bitwise_and(
+                    component,
+                    road_mask
+                )
+            )
+        )
+
+
+        if component_pixels == 0:
+
+            continue
+
+
+        road_overlap = (
+            road_pixels /
+            component_pixels
+        )
+
+
+        if road_overlap < 0.80:
+
+            continue
+
+
+        if min(w, h) < 8:
+
+            continue
+
+
+        cv2.drawContours(
+            pothole_mask,
+            [contour],
+            -1,
+            255,
+            -1
+        )
+
+
+        accepted += 1
+
+
+    if accepted == 0:
+
+        confidence = 0.0
+
+    elif accepted <= 2:
+
+        confidence = 0.45
+
+    elif accepted <= 4:
+
+        confidence = 0.35
+
+    else:
+
+        confidence = 0.20
+
+
+    return (
+        pothole_mask,
+        confidence
+    )
+
+
+# ============================================================
+# 23. SAFE SPACE
+# ============================================================
+
+def create_safe_space(
+    road_mask,
+    obstacle_mask,
+    pothole_mask,
+    boundary_ratio
+):
+
+    unsafe = cv2.bitwise_or(
+        obstacle_mask,
+        pothole_mask
+    )
+
+
+    expanded_unsafe = cv2.dilate(
+        unsafe,
+        np.ones(
+            (
+                15,
+                15
+            ),
+            np.uint8
+        ),
+        iterations=1
+    )
+
+
+    safe = cv2.bitwise_and(
+        road_mask,
+        cv2.bitwise_not(
+            expanded_unsafe
+        )
+    )
+
+
+    boundary_y = int(
+        PLANNER_HEIGHT *
+        boundary_ratio
+    )
+
+
+    safe[
+        boundary_y:,
+        :
+    ] = 0
+
+
+    return safe
+
+
+# ============================================================
+# 24. ROAD CONFIDENCE
+# ============================================================
+
+def calculate_road_confidence(
+    road_mask,
+    boundary_ratio
+):
+
+    start_y = int(
+        PLANNER_HEIGHT * 0.32
+    )
+
+
+    end_y = int(
+        PLANNER_HEIGHT *
+        boundary_ratio
+    )
+
+
+    if end_y <= start_y:
+
+        return 0.0
+
+
+    region = road_mask[
+        start_y:end_y,
+        :
+    ]
+
+
+    if region.size == 0:
+
+        return 0.0
+
+
+    value = np.mean(
+        region > 0
+    )
+
+
+    return float(
+        max(
+            0.0,
+            min(
+                1.0,
+                value
+            )
+        )
+    )
+
+
+# ============================================================
+# 25. BEST GAP
+# ============================================================
+
+def find_best_gap(
+    safe_mask
+):
+
+    best = None
+
+
+    levels = [
+        0.42,
+        0.45,
+        0.48,
+        0.51,
+        0.54,
+        0.57,
+        0.60,
+        0.63,
+        0.66
+    ]
+
+
+    image_center = (
+        PLANNER_WIDTH / 2
+    )
+
+
+    for level in levels:
+
+        y = int(
+            PLANNER_HEIGHT *
+            level
+        )
+
+
+        if y >= PLANNER_HEIGHT:
+
+            continue
+
+
+        row = safe_mask[y]
+
+
+        free = row > 0
+
+
+        starts = []
+        ends = []
+
+
+        inside = False
+
+        start = 0
+
+
+        for x in range(
+            PLANNER_WIDTH
+        ):
+
+            if (
+                free[x]
+                and
+                not inside
+            ):
+
+                start = x
+
+                inside = True
+
+
+            elif (
+                not free[x]
+                and
+                inside
+            ):
+
+                starts.append(
+                    start
+                )
+
+                ends.append(
+                    x - 1
+                )
+
+                inside = False
+
+
+        if inside:
+
+            starts.append(
+                start
+            )
+
+            ends.append(
+                PLANNER_WIDTH - 1
+            )
+
+
+        for x1, x2 in zip(
+            starts,
+            ends
+        ):
+
+            width = (
+                x2 - x1 + 1
+            )
+
+
+            if width < 20:
+
+                continue
+
+
+            center = (
+                x1 + x2
+            ) / 2.0
+
+
+            width_ratio = (
+                width /
+                PLANNER_WIDTH
+            )
+
+
+            center_error = abs(
+                center -
+                image_center
+            ) / image_center
+
+
+            score = (
+                width_ratio * 3.0
+                -
+                center_error * 1.2
+                +
+                level * 0.30
+            )
+
+
+            candidate = {
+
+                "x1": x1,
+
+                "x2": x2,
+
+                "center": center,
+
+                "width": width,
+
+                "width_ratio":
+                    width_ratio,
+
+                "level": level,
+
+                "score": score
+            }
+
+
+            if (
+                best is None
+                or
+                candidate["score"]
+                >
+                best["score"]
+            ):
+
+                best = candidate
+
+
+    return best
+
+
+# ============================================================
+# 26. PATH SMOOTHING
+# ============================================================
+
+def smooth_path(
+    center
+):
+
+    global previous_path_center
+
+
+    if previous_path_center is None:
+
+        previous_path_center = center
+
+        return center
+
+
+    smoothed = (
+        previous_path_center *
+        (1.0 - PATH_SMOOTHING)
+        +
+        center *
+        PATH_SMOOTHING
+    )
+
+
+    previous_path_center = smoothed
+
+
+    return smoothed
+
+
+# ============================================================
+# 27. PATH VELOCITY
+# ============================================================
+
+def estimate_path_velocity():
+
+    if len(path_history) < 3:
+
+        return 0.0
+
+
+    values = list(
+        path_history
+    )
+
+
+    differences = []
+
+
+    for i in range(
+        1,
+        len(values)
+    ):
+
+        differences.append(
+            values[i]
+            -
+            values[i - 1]
+        )
+
+
+    recent = differences[
+        -5:
+    ]
+
+
+    if not recent:
+
+        return 0.0
+
+
+    return float(
+        np.mean(
+            recent
+        )
+    )
+
+
+# ============================================================
+# 28. PREDICT FUTURE PATH
+# ============================================================
+
+def predict_path(
+    current_center
+):
+
+    global previous_predicted_center
+
+
+    path_history.append(
+        current_center
+    )
+
+
+    velocity = (
+        estimate_path_velocity()
+    )
+
+
+    predicted = (
+        current_center
+        +
+        velocity *
+        PREDICTION_FRAMES
+    )
+
+
+    maximum_shift = (
+        PLANNER_WIDTH *
+        MAX_PREDICTION_SHIFT
+    )
+
+
+    minimum = (
+        current_center -
+        maximum_shift
+    )
+
+
+    maximum = (
+        current_center +
+        maximum_shift
+    )
+
+
+    predicted = max(
+        minimum,
+        min(
+            maximum,
+            predicted
+        )
+    )
+
+
+    predicted = max(
+        0,
+        min(
+            PLANNER_WIDTH - 1,
+            predicted
+        )
+    )
+
+
+    if previous_predicted_center is not None:
+
+        predicted = (
+            previous_predicted_center *
+            0.60
+            +
+            predicted *
+            0.40
+        )
+
+
+    previous_predicted_center = predicted
+
+
+    return predicted
+
+
+# ============================================================
+# 29. PATH STABILITY
+# ============================================================
+
+def path_stability():
+
+    if len(path_history) < 3:
+
+        return 1.0
+
+
+    values = np.array(
+        list(path_history),
+        dtype=np.float32
+    )
+
+
+    changes = np.abs(
+        np.diff(values)
+    )
+
+
+    average_change = np.mean(
+        changes
+    )
+
+
+    normalized = (
+        average_change /
+        PLANNER_WIDTH
+    )
+
+
+    stability = (
+        1.0 -
+        normalized * 5.0
+    )
+
+
+    return float(
+        max(
+            0.0,
+            min(
+                1.0,
+                stability
+            )
+        )
+    )
+
+
+# ============================================================
+# 30. GAP CONFIDENCE
+# ============================================================
+
+def gap_confidence(
+    gap
+):
+
+    if gap is None:
+
+        return 0.0
+
+
+    width_ratio = (
+        gap["width_ratio"]
+    )
+
+
+    value = (
+        width_ratio /
+        0.30
+    )
+
+
+    return float(
+        max(
+            0.0,
+            min(
+                1.0,
+                value
+            )
+        )
+    )
+
+
+# ============================================================
+# 31. FUTURE PATH SAFETY
+# ============================================================
+
+def predicted_path_safety(
+    safe_mask,
+    predicted_center
+):
+
+    x = int(
+        predicted_center
+    )
+
+
+    x = max(
+        0,
+        min(
+            PLANNER_WIDTH - 1,
+            x
+        )
+    )
+
+
+    levels = [
+        0.45,
+        0.50,
+        0.55,
+        0.60
+    ]
+
+
+    safe_count = 0
+
+
+    for level in levels:
+
+        y = int(
+            PLANNER_HEIGHT *
+            level
+        )
+
+
+        if (
+            0 <= y <
+            PLANNER_HEIGHT
+        ):
+
+            left = max(
+                0,
+                x - 15
+            )
+
+
+            right = min(
+                PLANNER_WIDTH,
+                x + 15
+            )
+
+
+            region = safe_mask[
+                y,
+                left:right
+            ]
+
+
+            if (
+                region.size > 0
+                and
+                np.mean(
+                    region > 0
+                ) > 0.60
+            ):
+
+                safe_count += 1
+
+
+    return (
+        safe_count /
+        len(levels)
+    )
+
+
+# ============================================================
+# 32. SAFETY CONFIDENCE
+# ============================================================
+
+def calculate_safety_confidence(
+    road_conf,
+    gap_conf,
+    stability,
+    future_safety,
+    pothole_conf
+):
+
+    confidence = (
+
+        road_conf * 0.25
+
+        +
+
+        gap_conf * 0.30
+
+        +
+
+        stability * 0.20
+
+        +
+
+        future_safety * 0.20
+
+        +
+
+        (1.0 - pothole_conf) * 0.05
+    )
+
+
+    return float(
+        max(
+            0.0,
+            min(
+                1.0,
+                confidence
+            )
+        )
+    )
+
+
+# ============================================================
+# 33. NAVIGATION DECISION
+# ============================================================
+
+def navigation_decision(
+    gap,
+    predicted_center,
+    safety_confidence,
+    future_safety
+):
+
+    if gap is None:
+
+        return (
+            "STOP",
+            "STOP"
+        )
+
+
+    width_ratio = (
+        gap["width_ratio"]
+    )
+
+
+    if width_ratio < STOP_GAP_RATIO:
+
+        return (
+            "STOP",
+            "STOP"
+        )
+
+
+    if safety_confidence < STOP_CONFIDENCE:
+
+        return (
+            "STOP",
+            "STOP"
+        )
+
+
+    if future_safety < 0.25:
+
+        return (
+            "STOP",
+            "STOP"
+        )
+
+
+    normalized = (
+        predicted_center /
+        PLANNER_WIDTH
+    )
+
+
+    if (
+        width_ratio <
+        SLOW_GAP_RATIO
+
+        or
+
+        safety_confidence <
+        SLOW_CONFIDENCE
+
+        or
+
+        future_safety <
+        0.60
+    ):
+
+        safety = "SLOW"
+
+    else:
+
+        safety = "NORMAL"
+
+
+    if normalized < LEFT_LIMIT:
+
+        direction = "LEFT"
+
+    elif normalized > RIGHT_LIMIT:
+
+        direction = "RIGHT"
+
+    else:
+
+        direction = "FORWARD"
+
+
+    return (
+        direction,
+        safety
+    )
+
+
+# ============================================================
+# 34. DIRECTION STABILITY
+# ============================================================
+
+def stabilize_direction(
+    direction
+):
+
+    if direction == "STOP":
+
+        direction_history.clear()
+
+        return "STOP"
+
+
+    direction_history.append(
+        direction
+    )
+
+
+    if len(
+        direction_history
+    ) < 3:
+
+        return direction
+
+
+    recent = list(
+        direction_history
+    )[-3:]
+
+
+    if (
+        recent[0]
+        ==
+        recent[1]
+        ==
+        recent[2]
+    ):
+
+        return recent[-1]
+
+
+    if (
+        "LEFT" in recent
+        and
+        "RIGHT" in recent
+    ):
+
+        return "FORWARD"
+
+
+    return recent[-1]
+
+
+# ============================================================
+# 35. OVERLAY MASK
+# ============================================================
+
+def overlay_mask(
+    frame,
+    mask,
+    color,
+    alpha
+):
+
+    if mask is None:
+
+        return frame
+
+
+    full_mask = cv2.resize(
+        mask,
+        (
+            frame_width,
+            frame_height
+        ),
+        interpolation=cv2.INTER_NEAREST
+    )
+
+
+    layer = np.zeros_like(
+        frame
+    )
+
+
+    layer[:, :] = color
+
+
+    selected = (
+        full_mask > 0
+    )
+
+
+    frame[selected] = (
+        frame[selected] *
+        (1.0 - alpha)
+        +
+        layer[selected] *
+        alpha
+    ).astype(
+        np.uint8
+    )
+
+
+    return frame
+
+
+# ============================================================
+# 36. RESET STATE
+# ============================================================
+
+def reset_state():
+
+    global previous_boundary
+    global previous_path_center
+    global previous_predicted_center
+
+    previous_boundary = (
+        INITIAL_BOUNDARY_RATIO
+    )
+
+    previous_path_center = None
+
+    previous_predicted_center = None
+
+    path_history.clear()
+
+    width_history.clear()
+
+    direction_history.clear()
+
+    confidence_history.clear()
+
+
+# ============================================================
+# 37. MAIN LOOP
+# ============================================================
+
+frame_index = 0
+
+last_direction = "FORWARD"
+
+last_safety = "NORMAL"
+
+last_confidence = 0.0
+
+last_predicted_center = None
+
+
+# FPS measurement
+
+fps_history = deque(
+    maxlen=20
+)
+
+
+last_frame_time = (
+    time.perf_counter()
+)
+
+
+print()
+print("=" * 78)
+
+if MODE.upper() == "VIDEO":
+
+    print("Starting Module Q VIDEO mode...")
+
+else:
+
+    print("Starting Module Q LIVE mode...")
+
+    print(
+        "Press Q or ESC to stop."
+    )
+
+print("=" * 78)
+print()
+
+
+try:
+
+    while True:
+
+        # ====================================================
+        # A. READ FRAME
+        # ====================================================
+
+        ret, frame = cap.read()
+
+
+        if not ret:
+
+            break
+
+
+        frame_index += 1
+
+
+        loop_start = (
+            time.perf_counter()
+        )
+
+
+        # ====================================================
+        # B. ROAD
+        # ====================================================
+
+        if (
+            frame_index == 1
+            or
+            frame_index %
+            SEGMENTATION_INTERVAL == 0
+        ):
+
+            cached_road_mask = (
+                get_road_mask(
+                    frame
+                )
+            )
+
+
+        road_mask = (
+            cached_road_mask
+        )
+
+
+        # ====================================================
+        # C. OWN VEHICLE BOUNDARY
+        # ====================================================
+
+        boundary_ratio = (
+            estimate_vehicle_boundary(
+                road_mask
+            )
+        )
+
+
+        vehicle_mask = (
+            own_vehicle_mask(
+                boundary_ratio
+            )
+        )
+
+
+        # ====================================================
+        # D. OBSTACLES
+        # ====================================================
+
+        if (
+            frame_index == 1
+            or
+            frame_index %
+            DETECTION_INTERVAL == 0
+        ):
+
+            (
+                cached_obstacle_mask,
+                cached_obstacles,
+                cached_obstacle_confidence
+            ) = detect_obstacles(
+                frame,
+                boundary_ratio
+            )
+
+
+        obstacle_mask = (
+            cached_obstacle_mask
+        )
+
+
+        obstacles = (
+            cached_obstacles
+        )
+
+
+        obstacle_confidence = (
+            cached_obstacle_confidence
+        )
+
+
+        # ====================================================
+        # E. POTHOLES
+        # ====================================================
+
+        if (
+            frame_index == 1
+            or
+            frame_index %
+            POTHOLE_INTERVAL == 0
+        ):
+
+            (
+                cached_pothole_mask,
+                cached_pothole_confidence
+            ) = detect_potholes(
+                frame,
+                road_mask,
+                obstacle_mask,
+                boundary_ratio
+            )
+
+
+        pothole_mask = (
+            cached_pothole_mask
+        )
+
+
+        pothole_confidence = (
+            cached_pothole_confidence
+        )
+
+
+        # ====================================================
+        # F. SAFE AREA
+        # ====================================================
+
+        safe_mask = (
+            create_safe_space(
+                road_mask,
+                obstacle_mask,
+                pothole_mask,
+                boundary_ratio
+            )
+        )
+
+
+        # ====================================================
+        # G. ROAD CONFIDENCE
+        # ====================================================
+
+        road_confidence = (
+            calculate_road_confidence(
+                road_mask,
+                boundary_ratio
+            )
+        )
+
+
+        # ====================================================
+        # H. CURRENT GAP
+        # ====================================================
+
+        gap = (
+            find_best_gap(
+                safe_mask
+            )
+        )
+
+
+        # ====================================================
+        # I. PREDICTIVE PATH
+        # ====================================================
+
+        if gap is not None:
+
+            current_center = (
+                gap["center"]
+            )
+
+
+            smoothed_center = (
+                smooth_path(
+                    current_center
+                )
+            )
+
+
+            predicted_center = (
+                predict_path(
+                    smoothed_center
+                )
+            )
+
+
+            last_predicted_center = (
+                predicted_center
+            )
+
+
+            gap["center"] = (
+                smoothed_center
+            )
+
+
+            current_gap_confidence = (
+                gap_confidence(
+                    gap
+                )
+            )
+
+
+            stability = (
+                path_stability()
+            )
+
+
+            future_safety = (
+                predicted_path_safety(
+                    safe_mask,
+                    predicted_center
+                )
+            )
+
+
+        else:
+
+            predicted_center = None
+
+            current_gap_confidence = 0.0
+
+            stability = 0.0
+
+            future_safety = 0.0
+
+
+        # ====================================================
+        # J. FINAL CONFIDENCE
+        # ====================================================
+
+        safety_confidence = (
+            calculate_safety_confidence(
+                road_confidence,
+                current_gap_confidence,
+                stability,
+                future_safety,
+                pothole_confidence
+            )
+        )
+
+
+        confidence_history.append(
+            safety_confidence
+        )
+
+
+        if len(
+            confidence_history
+        ) >= 3:
+
+            displayed_confidence = float(
+                np.mean(
+                    list(
+                        confidence_history
+                    )[-3:]
+                )
+            )
+
+        else:
+
+            displayed_confidence = (
+                safety_confidence
+            )
+
+
+        # ====================================================
+        # K. NAVIGATION
+        # ====================================================
+
+        if predicted_center is not None:
+
+            (
+                direction,
+                safety
+            ) = navigation_decision(
+                gap,
+                predicted_center,
+                displayed_confidence,
+                future_safety
+            )
+
+        else:
+
+            direction = "STOP"
+
+            safety = "STOP"
+
+
+        direction = (
+            stabilize_direction(
+                direction
+            )
+        )
+
+
+        last_direction = direction
+
+        last_safety = safety
+
+        last_confidence = (
+            displayed_confidence
+        )
+
+
+        # ====================================================
+        # L. DRAW OUTPUT
+        # ====================================================
+
+        output = frame.copy()
+
+
+        # ROAD
+
+        output = overlay_mask(
+            output,
+            road_mask,
+            (80, 180, 80),
+            0.08
+        )
+
+
+        # SAFE SPACE
+
+        output = overlay_mask(
+            output,
+            safe_mask,
+            (0, 255, 0),
+            0.25
+        )
+
+
+        # POTHOLES
+
+        if (
+            pothole_confidence >= 0.40
+        ):
+
+            output = overlay_mask(
+                output,
+                pothole_mask,
+                (255, 0, 255),
+                0.50
+            )
+
+
+        # OBSTACLES
+
+        output = overlay_mask(
+            output,
+            obstacle_mask,
+            (0, 0, 255),
+            0.40
+        )
+
+
+        # ====================================================
+        # M. OBSTACLE BOXES
+        # ====================================================
+
+        for (
+            x1,
+            y1,
+            x2,
+            y2,
+            label,
+            confidence
+        ) in obstacles:
+
+
+            fx1 = int(
+                x1 /
+                PLANNER_WIDTH *
+                frame_width
+            )
+
+
+            fy1 = int(
+                y1 /
+                PLANNER_HEIGHT *
+                frame_height
+            )
+
+
+            fx2 = int(
+                x2 /
+                PLANNER_WIDTH *
+                frame_width
+            )
+
+
+            fy2 = int(
+                y2 /
+                PLANNER_HEIGHT *
+                frame_height
+            )
+
+
+            cv2.rectangle(
+                output,
+                (
+                    fx1,
+                    fy1
+                ),
+                (
+                    fx2,
+                    fy2
+                ),
+                (0, 0, 255),
+                3
+            )
+
+
+            cv2.putText(
+                output,
+                f"{label} {confidence:.2f}",
+                (
+                    fx1,
+                    max(
+                        25,
+                        fy1 - 8
+                    )
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 0, 255),
+                2
+            )
+
+
+        # ====================================================
+        # N. OWN VEHICLE BOUNDARY
+        # ====================================================
+
+        boundary_full_y = int(
+            frame_height *
+            boundary_ratio
+        )
+
+
+        cv2.line(
+            output,
+            (
+                0,
+                boundary_full_y
+            ),
+            (
+                frame_width,
+                boundary_full_y
+            ),
+            (255, 255, 255),
+            4
+        )
+
+
+        cv2.putText(
+            output,
+            "OWN VEHICLE - IGNORED BELOW",
+            (
+                30,
+                boundary_full_y - 12
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.80,
+            (255, 255, 255),
+            2
+        )
+
+
+        # ====================================================
+        # O. CURRENT GAP
+        # ====================================================
+
+        if gap is not None:
+
+            gx1 = int(
+                gap["x1"] /
+                PLANNER_WIDTH *
+                frame_width
+            )
+
+
+            gx2 = int(
+                gap["x2"] /
+                PLANNER_WIDTH *
+                frame_width
+            )
+
+
+            gy = int(
+                gap["level"] *
+                frame_height
+            )
+
+
+            cv2.line(
+                output,
+                (
+                    gx1,
+                    gy
+                ),
+                (
+                    gx2,
+                    gy
+                ),
+                (0, 255, 0),
+                6
+            )
+
+
+            current_x = int(
+                gap["center"] /
+                PLANNER_WIDTH *
+                frame_width
+            )
+
+
+            cv2.circle(
+                output,
+                (
+                    current_x,
+                    gy
+                ),
+                9,
+                (255, 255, 0),
+                -1
+            )
+
+
+        # ====================================================
+        # P. PREDICTED PATH
+        # ====================================================
+
+        if (
+            predicted_center is not None
+        ):
+
+            predicted_x = int(
+                predicted_center /
+                PLANNER_WIDTH *
+                frame_width
+            )
+
+
+            cv2.line(
+                output,
+                (
+                    predicted_x,
+                    int(
+                        frame_height * 0.35
+                    )
+                ),
+                (
+                    predicted_x,
+                    boundary_full_y
+                ),
+                (255, 0, 255),
+                5
+            )
+
+
+            cv2.putText(
+                output,
+                "PREDICTED PATH",
+                (
+                    predicted_x + 10,
+                    int(
+                        frame_height * 0.40
+                    )
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 0, 255),
+                2
+            )
+
+
+        # ====================================================
+        # Q. TOP INFORMATION PANEL
+        # ====================================================
+
+        cv2.rectangle(
+            output,
+            (
+                20,
+                20
+            ),
+            (
+                780,
+                255
+            ),
+            (0, 0, 0),
+            -1
+        )
+
+
+        cv2.putText(
+            output,
+            f"NAVIGATION: {direction}",
+            (
+                40,
+                60
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.05,
+            (255, 255, 255),
+            3
+        )
+
+
+        cv2.putText(
+            output,
+            f"SAFETY: {safety}",
+            (
+                40,
+                100
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.85,
+            (255, 255, 255),
+            2
+        )
+
+
+        cv2.putText(
+            output,
+            f"CONFIDENCE: "
+            f"{displayed_confidence * 100:.0f}%",
+            (
+                40,
+                137
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (255, 255, 255),
+            2
+        )
+
+
+        cv2.putText(
+            output,
+            f"PATH STABILITY: "
+            f"{stability * 100:.0f}%",
+            (
+                40,
+                172
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.70,
+            (255, 255, 255),
+            2
+        )
+
+
+        cv2.putText(
+            output,
+            f"FUTURE SAFETY: "
+            f"{future_safety * 100:.0f}%",
+            (
+                40,
+                207
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.70,
+            (255, 255, 255),
+            2
+        )
+
+
+        # ====================================================
+        # R. PERFORMANCE
+        # ====================================================
+
+        current_time = (
+            time.perf_counter()
+        )
+
+
+        elapsed = (
+            current_time -
+            last_frame_time
+        )
+
+
+        if elapsed > 0:
+
+            current_fps = (
+                1.0 /
+                elapsed
+            )
+
+        else:
+
+            current_fps = 0.0
+
+
+        last_frame_time = (
+            current_time
+        )
+
+
+        fps_history.append(
+            current_fps
+        )
+
+
+        measured_fps = float(
+            np.mean(
+                fps_history
+            )
+        )
+
+
+        cv2.putText(
+            output,
+            f"FPS: {measured_fps:.1f}",
+            (
+                40,
+                240
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2
+        )
+
+
+        # ====================================================
+        # S. BIG NAVIGATION SIGNAL
+        # ====================================================
+
+        if direction == "STOP":
+
+            signal_color = (
+                0,
+                0,
+                255
+            )
+
+        elif direction == "FORWARD":
+
+            signal_color = (
+                0,
+                255,
+                0
+            )
+
+        else:
+
+            signal_color = (
+                255,
+                200,
+                0
+            )
+
+
+        cv2.putText(
+            output,
+            direction,
+            (
+                frame_width - 380,
+                90
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.40,
+            signal_color,
+            4
+        )
+
+
+        # ====================================================
+        # T. SAFETY SIGNAL
+        # ====================================================
+
+        cv2.putText(
+            output,
+            safety,
+            (
+                frame_width - 380,
+                130
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.90,
+            signal_color,
+            3
+        )
+
+
+        # ====================================================
+        # U. GAP INFORMATION
+        # ====================================================
+
+        if gap is not None:
+
+            cv2.putText(
+                output,
+                f"GAP: "
+                f"{gap['width_ratio'] * 100:.1f}%",
+                (
+                    frame_width - 380,
+                    170
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (255, 255, 255),
+                2
+            )
+
+
+        # ====================================================
+        # V. MODE
+        # ====================================================
+
+        cv2.putText(
+            output,
+            f"MODE: {MODE}",
+            (
+                frame_width - 380,
+                210
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2
+        )
+
+
+        # ====================================================
+        # W. FRAME INFORMATION
+        # ====================================================
+
+        if MODE.upper() == "VIDEO":
+
+            cv2.putText(
+                output,
+                f"Frame: "
+                f"{frame_index}/"
+                f"{total_frames}",
+                (
+                    30,
+                    frame_height - 30
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2
+            )
+
+        else:
+
+            cv2.putText(
+                output,
+                f"Frame: {frame_index}",
+                (
+                    30,
+                    frame_height - 30
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2
+            )
+
+
+        # ====================================================
+        # X. SAVE VIDEO
+        # ====================================================
+
+        if writer is not None:
+
+            writer.write(
+                output
+            )
+
+
+        # ====================================================
+        # Y. LIVE DISPLAY
+        # ====================================================
+
+        if (
+            MODE.upper() == "LIVE"
+            and
+            SHOW_LIVE_WINDOW
+        ):
+
+            cv2.imshow(
+                "FSIH MODULE Q - LIVE",
+                output
+            )
+
+
+            key = (
+                cv2.waitKey(1)
+                &
+                0xFF
+            )
+
+
+            if key in (
+                ord("q"),
+                27
+            ):
+
+                print(
+                    "\nStopping LIVE mode..."
+                )
+
+                break
+
+
+        # ====================================================
+        # Z. VIDEO PROGRESS
+        # ====================================================
+
+        if (
+            MODE.upper() == "VIDEO"
+            and
+            frame_index % 50 == 0
+        ):
+
+            percent = (
+                frame_index /
+                max(
+                    1,
+                    total_frames
+                )
+            ) * 100
+
+
+            print(
+                f"Frame "
+                f"{frame_index}/"
+                f"{total_frames} "
+                f"({percent:.1f}%) | "
+                f"{direction} | "
+                f"{safety} | "
+                f"Confidence "
+                f"{displayed_confidence:.2f} | "
+                f"Future "
+                f"{future_safety:.2f} | "
+                f"FPS "
+                f"{measured_fps:.1f}"
+            )
+
+
+        # ====================================================
+        # LIVE STATUS
+        # ====================================================
+
+        if (
+            MODE.upper() == "LIVE"
+            and
+            frame_index % 30 == 0
+        ):
+
+            print(
+                f"LIVE | "
+                f"Frame {frame_index} | "
+                f"{direction} | "
+                f"{safety} | "
+                f"Confidence "
+                f"{displayed_confidence:.2f} | "
+                f"Future "
+                f"{future_safety:.2f} | "
+                f"FPS "
+                f"{measured_fps:.1f}"
+            )
+
+
+finally:
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    cap.release()
+
+
+    if writer is not None:
+
+        writer.release()
+
+
+    cv2.destroyAllWindows()
+
+
+# ============================================================
+# FINAL REPORT
+# ============================================================
+
+print()
+print("=" * 78)
+print("MODULE Q COMPLETE")
+print("=" * 78)
+
+
+if MODE.upper() == "VIDEO":
+
+    print(
+        "Saved:",
+        OUTPUT_VIDEO
+    )
+
+elif RECORD_LIVE and writer is not None:
+
+    print(
+        "Live recording saved."
+    )
+
+
+print(
+    "Final navigation:",
+    last_direction
+)
+
+
+print(
+    "Final safety:",
+    last_safety
+)
+
+
+print(
+    "Final confidence:",
+    f"{last_confidence * 100:.1f}%"
+)
+
+
+print()
+print("Architecture:")
+print(
+    "O+P perception"
+    " -> predictive path"
+    " -> safe gap"
+    " -> navigation"
+)
+
+
+print()
+print("Navigation signals:")
+print(
+    "LEFT / FORWARD / RIGHT / STOP"
+)
+
+
+print(
+    "Safety signals:"
+)
+
+
+print(
+    "NORMAL / SLOW / STOP"
+)
+
+
+print()
+print("Own vehicle rule:")
+print(
+    "Only the user's own-vehicle region "
+    "inside/below the dynamic boundary is ignored."
+)
+
+
+print(
+    "External vehicles and obstacles above "
+    "the boundary remain active."
+)
+
+
+print()
+print("=" * 78)
